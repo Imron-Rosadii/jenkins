@@ -130,48 +130,44 @@ pipeline {
         }
 
         stage('6. Deploy Production') {
-            when {
-                branch 'production'
-            }
-            steps {
-                script {
-                    env.PREVIOUS_CONTAINER =
-                        "${env.APP_NAME}-previous-${env.BUILD_NUMBER}"
-
-                    env.HAD_PREVIOUS = sh(
-                        script: '''
-                            docker inspect "$APP_NAME" \
-                              >/dev/null 2>&1 && echo 1 || echo 0
-                        ''',
-                        returnStdout: true
-                    ).trim()
-
-                    // Mulai sekarang, kegagalan pipeline perlu diperiksa
-                    // oleh mekanisme rollback di bagian post.
-                    env.DEPLOYMENT_ATTEMPTED = 'true'
-                }
-
-                sh '''
-                    set -eu
-
-                    OLD="$PREVIOUS_CONTAINER"
-                    NEW_IMAGE="${IMAGE_NAME}:${GIT_COMMIT_SHORT}"
-
-                    if [ "$HAD_PREVIOUS" = "1" ]; then
-                        docker stop "$APP_NAME"
-                        docker rename "$APP_NAME" "$OLD"
-                    fi
-
-                    docker run -d \
-                      --name "$APP_NAME" \
-                      --restart unless-stopped \
-                      -p "${APP_PORT}:80" \
-                      "$NEW_IMAGE"
-
-                    echo "New container started: $NEW_IMAGE"
-                '''
-            }
+    when {
+        branch 'production'
+    }
+    steps {
+        // Tandai bahwa deployment sudah dimulai.
+        script {
+            env.DEPLOYMENT_ATTEMPTED = 'true'
         }
+
+        sh '''
+            set -eu
+
+            OLD="${APP_NAME}-previous-${BUILD_NUMBER}"
+            NEW_IMAGE="${IMAGE_NAME}:${GIT_COMMIT_SHORT}"
+
+            # Hindari benturan nama container rollback.
+            if docker inspect "$OLD" >/dev/null 2>&1; then
+                echo "ERROR: Previous container name already exists: $OLD"
+                exit 1
+            fi
+
+            # Simpan container yang sedang aktif.
+            if docker inspect "$APP_NAME" >/dev/null 2>&1; then
+                docker stop "$APP_NAME"
+                docker rename "$APP_NAME" "$OLD"
+            fi
+
+            # Jalankan release baru.
+            docker run -d \
+              --name "$APP_NAME" \
+              --restart unless-stopped \
+              -p "${APP_PORT}:80" \
+              "$NEW_IMAGE"
+
+            echo "New container started: $NEW_IMAGE"
+        '''
+    }
+}
 
         stage('7. Verify Production') {
             when {
@@ -239,73 +235,58 @@ pipeline {
         }
 
         failure {
-            script {
-                if (env.BRANCH_NAME == 'production' &&
-                    env.DEPLOYMENT_ATTEMPTED == 'true' &&
-                    env.DEPLOYMENT_VERIFIED != 'true') {
+    script {
+        if (env.BRANCH_NAME == 'production' &&
+            env.DEPLOYMENT_ATTEMPTED == 'true' &&
+            env.DEPLOYMENT_VERIFIED != 'true') {
 
-                    echo 'Deployment failed. Attempting automatic rollback.'
+            echo 'Deployment failed. Attempting automatic rollback.'
 
-                    sh '''
-                        set -u
+            sh '''
+                set -eu
 
-                        OLD="$PREVIOUS_CONTAINER"
+                OLD="${APP_NAME}-previous-${BUILD_NUMBER}"
 
-                        if [ "$HAD_PREVIOUS" = "1" ]; then
-                            if docker inspect "$OLD" >/dev/null 2>&1; then
-                                # Container baru mungkin masih ada.
-                                docker rm -f "$APP_NAME" \
-                                  2>/dev/null || true
+                if docker inspect "$OLD" >/dev/null 2>&1; then
+                    # Hapus release baru jika sudah sempat dibuat.
+                    docker rm -f "$APP_NAME" 2>/dev/null || true
 
-                                if docker rename "$OLD" "$APP_NAME" &&
-                                   docker start "$APP_NAME"; then
-                                    echo "Previous container restored."
+                    # Pulihkan container release sebelumnya.
+                    docker rename "$OLD" "$APP_NAME"
+                    docker start "$APP_NAME"
 
-                                    if docker exec "$APP_NAME" \
-                                      wget -q -O /dev/null \
-                                      http://127.0.0.1/; then
-                                        echo "ROLLBACK SUCCESS"
-                                    else
-                                        echo "WARNING: Restored container failed health check."
-                                        exit 1
-                                    fi
-                                else
-                                    echo "CRITICAL: Automatic rollback failed."
-                                    exit 1
-                                fi
-                            elif docker inspect "$APP_NAME" \
-                                 >/dev/null 2>&1; then
-                                # Container lama mungkin belum sempat
-                                # diganti namanya.
-                                docker start "$APP_NAME" || true
+                elif docker inspect "$APP_NAME" >/dev/null 2>&1; then
+                    # Container lama mungkin belum sempat diganti nama.
+                    docker start "$APP_NAME" || true
 
-                                if docker exec "$APP_NAME" \
-                                  wget -q -O /dev/null \
-                                  http://127.0.0.1/; then
-                                    echo "Existing container recovered."
-                                else
-                                    echo "CRITICAL: Existing container is unhealthy."
-                                    exit 1
-                                fi
-                            else
-                                echo "CRITICAL: Previous container not found."
-                                exit 1
-                            fi
-                        else
-                            # Tidak ada versi sebelumnya untuk dipulihkan.
-                            docker rm -f "$APP_NAME" \
-                              2>/dev/null || true
-                            echo "No previous release existed."
-                        fi
-                    '''
-                }
-            }
+                else
+                    echo "CRITICAL: No previous container available."
+                    exit 1
+                fi
 
-            echo 'PIPELINE FAILURE - Check Console Output.'
+                # Verifikasi container yang dipulihkan.
+                OK=0
+                for i in $(seq 1 15); do
+                    if docker exec "$APP_NAME" \
+                      wget -q -O /dev/null http://127.0.0.1/; then
+                        OK=1
+                        break
+                    fi
+                    sleep 2
+                done
+
+                if [ "$OK" -ne 1 ]; then
+                    echo "CRITICAL: Rollback health check FAILED."
+                    docker logs "$APP_NAME" || true
+                    exit 1
+                fi
+
+                echo "ROLLBACK SUCCESS"
+            '''
         }
+    }
 
-        aborted {
-            echo 'PIPELINE ABORTED. Inspect deployment state before retrying.'
-        }
+    echo 'PIPELINE FAILURE - Check Console Output.'
+}
     }
 }

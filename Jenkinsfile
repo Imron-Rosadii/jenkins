@@ -1,4 +1,3 @@
-
 pipeline {
     agent any
 
@@ -12,6 +11,10 @@ pipeline {
         IMAGE_NAME = 'portfolio-web'
         APP_PORT   = '8081'
         TEST_PORT  = '8082'
+        DEPLOYMENT_ATTEMPTED = 'false'
+        DEPLOYMENT_VERIFIED  = 'false'
+        HAD_PREVIOUS         = '0'
+        PREVIOUS_CONTAINER   = ''
     }
 
     stages {
@@ -67,20 +70,15 @@ pipeline {
                 sh '''
                     set -eu
 
-                    docker build --pull \
+                    docker build \
                       -t "${IMAGE_NAME}:${BUILD_NUMBER}" \
                       -t "${IMAGE_NAME}:${GIT_COMMIT_SHORT}" \
                       .
 
                     docker image inspect \
-                      "${IMAGE_NAME}:${BUILD_NUMBER}" >/dev/null
-
-                    docker image inspect \
                       "${IMAGE_NAME}:${GIT_COMMIT_SHORT}" >/dev/null
 
                     echo "Image build SUCCESS"
-                    echo "Build tag: ${IMAGE_NAME}:${BUILD_NUMBER}"
-                    echo "Commit tag: ${IMAGE_NAME}:${GIT_COMMIT_SHORT}"
                 '''
             }
         }
@@ -100,10 +98,9 @@ pipeline {
                     docker run -d \
                       --name "$CANDIDATE" \
                       -p "${TEST_PORT}:80" \
-                      "${IMAGE_NAME}:${BUILD_NUMBER}"
+                      "${IMAGE_NAME}:${GIT_COMMIT_SHORT}"
 
                     OK=0
-
                     for i in $(seq 1 15); do
                         if docker exec "$CANDIDATE" \
                           wget -q -O /dev/null http://127.0.0.1/; then
@@ -142,38 +139,34 @@ pipeline {
                         "${env.APP_NAME}-previous-${env.BUILD_NUMBER}"
 
                     env.HAD_PREVIOUS = sh(
-                        script: 'docker inspect portfolio-web >/dev/null 2>&1 && echo 1 || echo 0',
+                        script: '''
+                            docker inspect "$APP_NAME" \
+                              >/dev/null 2>&1 && echo 1 || echo 0
+                        ''',
                         returnStdout: true
                     ).trim()
+
+                    // Mulai sekarang, kegagalan pipeline perlu diperiksa
+                    // oleh mekanisme rollback di bagian post.
+                    env.DEPLOYMENT_ATTEMPTED = 'true'
                 }
 
                 sh '''
                     set -eu
 
                     OLD="$PREVIOUS_CONTAINER"
-                    HAD_OLD="$HAD_PREVIOUS"
                     NEW_IMAGE="${IMAGE_NAME}:${GIT_COMMIT_SHORT}"
 
-                    # Simpan container lama untuk rollback.
-                    if [ "$HAD_OLD" = "1" ]; then
+                    if [ "$HAD_PREVIOUS" = "1" ]; then
                         docker stop "$APP_NAME"
                         docker rename "$APP_NAME" "$OLD"
                     fi
 
-                    # Jalankan image baru.
-                    if ! docker run -d \
+                    docker run -d \
                       --name "$APP_NAME" \
                       --restart unless-stopped \
                       -p "${APP_PORT}:80" \
-                      "$NEW_IMAGE"; then
-
-                        if [ "$HAD_OLD" = "1" ]; then
-                            docker rename "$OLD" "$APP_NAME"
-                            docker start "$APP_NAME"
-                        fi
-
-                        exit 1
-                    fi
+                      "$NEW_IMAGE"
 
                     echo "New container started: $NEW_IMAGE"
                 '''
@@ -188,8 +181,8 @@ pipeline {
                 sh '''
                     set -eu
 
+                    # Periksa HTTP dari dalam container.
                     OK=0
-
                     for i in $(seq 1 15); do
                         if docker exec "$APP_NAME" \
                           wget -q -O /dev/null http://127.0.0.1/; then
@@ -200,46 +193,119 @@ pipeline {
                     done
 
                     if [ "$OK" -ne 1 ]; then
-                        echo "Production verification FAILED"
+                        echo "Container health check FAILED"
                         docker logs "$APP_NAME" || true
+                        exit 1
+                    fi
 
-                        # Hapus container versi baru.
-                        docker rm -f "$APP_NAME" 2>/dev/null || true
+                    # Periksa port produksi dari host melalui gateway
+                    # jaringan Docker bridge.
+                    HOST_GATEWAY=$(docker network inspect bridge \
+                      --format '{{(index .IPAM.Config 0).Gateway}}')
 
-                        # Pulihkan container sebelumnya.
-                        if [ "$HAD_PREVIOUS" = "1" ]; then
-                            docker rename "$PREVIOUS_CONTAINER" "$APP_NAME"
-                            docker start "$APP_NAME"
-                            echo "ROLLBACK SUCCESS"
-                        else
-                            echo "No previous container available."
+                    OK=0
+                    for i in $(seq 1 15); do
+                        if wget -q -O /dev/null \
+                          "http://${HOST_GATEWAY}:${APP_PORT}/"; then
+                            OK=1
+                            break
                         fi
+                        sleep 2
+                    done
 
+                    if [ "$OK" -ne 1 ]; then
+                        echo "Production endpoint check FAILED"
                         exit 1
                     fi
 
                     echo "Production verification SUCCESS"
-                    docker ps --filter "name=^/${APP_NAME}$"
                     docker port "$APP_NAME"
 
                     docker exec "$APP_NAME" \
                       wget -q -O - http://127.0.0.1/
-
-                    echo
                 '''
+
+                script {
+                    env.DEPLOYMENT_VERIFIED = 'true'
+                }
             }
         }
     }
 
     post {
         success {
+           
             echo 'PIPELINE SUCCESS'
         }
+
         failure {
+            script {
+                if (env.BRANCH_NAME == 'production' &&
+                    env.DEPLOYMENT_ATTEMPTED == 'true' &&
+                    env.DEPLOYMENT_VERIFIED != 'true') {
+
+                    echo 'Deployment failed. Attempting automatic rollback.'
+
+                    sh '''
+                        set -u
+
+                        OLD="$PREVIOUS_CONTAINER"
+
+                        if [ "$HAD_PREVIOUS" = "1" ]; then
+                            if docker inspect "$OLD" >/dev/null 2>&1; then
+                                # Container baru mungkin masih ada.
+                                docker rm -f "$APP_NAME" \
+                                  2>/dev/null || true
+
+                                if docker rename "$OLD" "$APP_NAME" &&
+                                   docker start "$APP_NAME"; then
+                                    echo "Previous container restored."
+
+                                    if docker exec "$APP_NAME" \
+                                      wget -q -O /dev/null \
+                                      http://127.0.0.1/; then
+                                        echo "ROLLBACK SUCCESS"
+                                    else
+                                        echo "WARNING: Restored container failed health check."
+                                        exit 1
+                                    fi
+                                else
+                                    echo "CRITICAL: Automatic rollback failed."
+                                    exit 1
+                                fi
+                            elif docker inspect "$APP_NAME" \
+                                 >/dev/null 2>&1; then
+                                # Container lama mungkin belum sempat
+                                # diganti namanya.
+                                docker start "$APP_NAME" || true
+
+                                if docker exec "$APP_NAME" \
+                                  wget -q -O /dev/null \
+                                  http://127.0.0.1/; then
+                                    echo "Existing container recovered."
+                                else
+                                    echo "CRITICAL: Existing container is unhealthy."
+                                    exit 1
+                                fi
+                            else
+                                echo "CRITICAL: Previous container not found."
+                                exit 1
+                            fi
+                        else
+                            # Tidak ada versi sebelumnya untuk dipulihkan.
+                            docker rm -f "$APP_NAME" \
+                              2>/dev/null || true
+                            echo "No previous release existed."
+                        fi
+                    '''
+                }
+            }
+
             echo 'PIPELINE FAILURE - Check Console Output.'
         }
+
         aborted {
-            echo 'PIPELINE ABORTED.'
+            echo 'PIPELINE ABORTED. Inspect deployment state before retrying.'
         }
     }
 }

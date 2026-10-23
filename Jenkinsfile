@@ -1,49 +1,79 @@
 pipeline {
     agent any
 
+    options {
+        skipDefaultCheckout(true)
+        timestamps()
+    }
+
     stages {
         stage('1. Clone Code') {
             steps {
-                echo 'Mengunduh kode terbaru dari GitHub...'
+                echo "Branch yang diproses: ${env.BRANCH_NAME}"
+                echo 'Mengunduh kode dari GitHub...'
                 checkout scm
             }
         }
-        
-        stage('2. Validasi & Pengujian Kode (Test)') {
+
+        stage('2. Validate HTML') {
             steps {
-                echo 'Memulai proses validasi dokumen...'
-                
-                // VALIDASI 1: Memeriksa apakah file index.html ada di dalam repository
-                // Catatan: Jika Jenkins Anda di Windows, ganti 'sh' menjadi 'bat'
-                sh 'ls -la index.html' 
-                
-                // VALIDASI 2: Memeriksa apakah file tersebut kosong atau tidak
-                echo 'Memastikan file index.html berisi kode...'
-                sh '[ -s index.html ]' // Akan error jika file berukuran 0 byte
-                
-                // VALIDASI 3: Simulasi pengecekan tag HTML (opsional)
-                echo 'Validasi struktur HTML berhasil dilewati dengan sukses.'
+                echo 'Memeriksa file index.html...'
+                sh 'test -s index.html'
+                echo 'Validasi berhasil: index.html tersedia dan tidak kosong.'
             }
         }
-        
-        stage('3. Build & Deploy Simulation') {
+
+        stage('3. Test') {
             steps {
-                echo 'Aplikasi lolos validasi!'
-                echo 'Simulasi Deployment: Aplikasi web statis siap digunakan di server!'
+                echo 'Menjalankan pengujian dasar...'
+                sh 'test -r index.html'
+                echo 'Pengujian dasar berhasil.'
+            }
+        }
+
+        stage('4. Deploy to Staging (Simulation)') {
+            when {
+                branch 'staging'
+            }
+            steps {
+                echo 'Simulasi deployment ke staging...'
+                echo 'STAGING DEPLOYMENT SIMULATION SUCCESS'
+            }
+        }
+
+        stage('5. Production Approval') {
+            when {
+                branch 'production'
+            }
+            steps {
+                input(
+                    message: 'Apakah kamu menyetujui deployment ke PRODUCTION?',
+                    ok: 'Approve Deployment'
+                )
+            }
+        }
+
+        stage('6. Deploy to Production (Simulation)') {
+            when {
+                branch 'production'
+            }
+            steps {
+                echo 'Persetujuan diterima.'
+                echo 'Simulasi deployment ke production...'
+                echo 'PRODUCTION DEPLOYMENT SIMULATION SUCCESS'
             }
         }
     }
-    
+
     post {
         success {
-            echo '==================================================='
-            echo ' Hasil: VALIDASI BERHASIL & PIPELINE SUKSES! '
-            echo '==================================================='
+            echo 'PIPELINE SUCCESS'
         }
         failure {
-            echo '==================================================='
-            echo ' Hasil: VALIDASI GAGAL! Periksa kembali kode Anda. '
-            echo '==================================================='
+            echo 'PIPELINE FAILURE - Periksa Console Output.'
+        }
+        aborted {
+            echo 'PIPELINE ABORTED - Proses dihentikan atau dibatalkan.'
         }
     }
 }

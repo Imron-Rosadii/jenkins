@@ -215,8 +215,6 @@ pipeline {
                     fi
 
                     echo "Container health check PASSED"
-                    echo "SIMULATED FAILURE: Testing automatic rollback"
-                    exit 1
                     echo "Checking published host port ${APP_PORT}..."
 
                     # Jalankan pemeriksa sementara di network namespace host.

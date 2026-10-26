@@ -5,6 +5,7 @@ pipeline {
     options {
         skipDefaultCheckout(true)
         timestamps()
+        disableConcurrentBuilds()
     }
 
     environment {
@@ -14,6 +15,9 @@ pipeline {
         TEST_PORT            = '8082'
         DEPLOYMENT_ATTEMPTED = 'false'
         DEPLOYMENT_VERIFIED  = 'false'
+        HAD_PREVIOUS         = 'false'
+        PREVIOUS_CONTAINER   = ''
+        PREVIOUS_IMAGE_ID    = ''
     }
 
     stages {
@@ -139,50 +143,76 @@ pipeline {
             }
             steps {
                 script {
+                    env.DEPLOYMENT_VERIFIED = 'false'
+                    def backupName = "${env.APP_NAME}-previous-${env.BUILD_NUMBER}"
+
+                    def backupExists = sh(
+                        script: "docker inspect '${backupName}' >/dev/null 2>&1",
+                        returnStatus: true
+                    ) == 0
+
+                    if (backupExists) {
+                        error("Backup container already exists: ${backupName}")
+                    }
+
+                    env.PREVIOUS_CONTAINER = backupName
+
+                    env.HAD_PREVIOUS = sh(
+                        script: '''
+                            if docker inspect "$APP_NAME" >/dev/null 2>&1; then
+                                echo true
+                            else
+                                echo false
+                            fi
+                        ''',
+                        returnStdout: true
+                    ).trim()
+
+                    env.PREVIOUS_IMAGE_ID = ''
+
+                    if (env.HAD_PREVIOUS == 'true') {
+                        env.PREVIOUS_IMAGE_ID = sh(
+                            script: '''
+                                docker inspect --format '{{.Image}}' "$APP_NAME"
+                            ''',
+                            returnStdout: true
+                        ).trim()
+                    }
+
                     env.DEPLOYMENT_ATTEMPTED = 'true'
-                }
 
-                sh '''
-                    set -eu
+                    echo "Previous release exists: ${env.HAD_PREVIOUS}"
+                    echo "Backup name: ${env.PREVIOUS_CONTAINER}"
+                    echo "Previous image ID: ${env.PREVIOUS_IMAGE_ID}"
 
-                    OLD="${APP_NAME}-previous-${BUILD_NUMBER}"
-                    NEW_IMAGE="${IMAGE_NAME}:${GIT_COMMIT_SHORT}"
+                    sh '''
+                        set -eu
 
-                    # Hindari benturan nama backup.
-                    if docker inspect "$OLD" >/dev/null 2>&1; then
-                        echo "ERROR: Backup container already exists: $OLD"
-                        exit 1
-                    fi
+                        OLD="$PREVIOUS_CONTAINER"
+                        NEW_IMAGE="${IMAGE_NAME}:${GIT_COMMIT_SHORT}"
 
-                    # Simpan release lama jika tersedia.
-                    if docker inspect "$APP_NAME" >/dev/null 2>&1; then
-                        docker stop "$APP_NAME"
-                        docker rename "$APP_NAME" "$OLD"
-                    fi
+                        if [ "$HAD_PREVIOUS" = "true" ]; then
+                            # Cegah backup lama otomatis restart.
+                            docker update --restart=no "$APP_NAME"
+                            docker stop "$APP_NAME"
+                            docker rename "$APP_NAME" "$OLD"
 
-                    # Jalankan release baru.
-                    if ! docker run -d \
-                        --name "$APP_NAME" \
-                        --restart unless-stopped \
-                        -p "${APP_PORT}:80" \
-                        "$NEW_IMAGE"; then
-
-                        echo "ERROR: New container failed to start"
-
-                        # Pulihkan release lama jika tersedia.
-                        if docker inspect "$OLD" >/dev/null 2>&1; then
-                            docker rm -f "$APP_NAME" 2>/dev/null || true
-                            docker rename "$OLD" "$APP_NAME"
-                            docker start "$APP_NAME"
+                            echo "Previous release saved as $OLD"
+                        else
+                            echo "No previous release exists."
                         fi
 
-                        exit 1
-                    fi
+                        docker run -d \
+                            --name "$APP_NAME" \
+                            --restart unless-stopped \
+                            -p "${APP_PORT}:80" \
+                            "$NEW_IMAGE"
 
-                    echo "New container started: $NEW_IMAGE"
-                '''
+                        echo "New production container started: $NEW_IMAGE"
+                    '''
+                    }
+                }
             }
-        }
 
         stage('7. Verify Production') {
             when {
@@ -255,47 +285,80 @@ pipeline {
         }
     }
 
+
     post {
         success {
             echo 'PIPELINE SUCCESS'
         }
 
-        failure {
+        unsuccessful {
             script {
                 if (env.BRANCH_NAME == 'production' &&
                     env.DEPLOYMENT_ATTEMPTED == 'true' &&
                     env.DEPLOYMENT_VERIFIED != 'true') {
 
-                    echo 'Deployment failed. Attempting automatic rollback.'
+                    echo 'Deployment unsuccessful. Starting rollback recovery.'
 
                     sh '''
                         set -eu
 
-                        OLD="${APP_NAME}-previous-${BUILD_NUMBER}"
+                        OLD="$PREVIOUS_CONTAINER"
 
                         if docker inspect "$OLD" >/dev/null 2>&1; then
-                            # Hentikan/hapus release baru jika ada.
+                            BACKUP_IMAGE_ID=$(docker inspect \
+                             --format '{{.Image}}' "$OLD")
+
+                            if [ "$BACKUP_IMAGE_ID" != "$PREVIOUS_IMAGE_ID" ]; then
+                                echo "CRITICAL: Backup image does not match previous release."
+                                exit 1
+                            fi
+                            # Backup ditemukan: pulihkan release lama.
+                            echo "Previous release found: $OLD"
+
                             docker rm -f "$APP_NAME" 2>/dev/null || true
 
-                            # Pulihkan release sebelumnya.
                             docker rename "$OLD" "$APP_NAME"
+                            docker update --restart=unless-stopped "$APP_NAME"
                             docker start "$APP_NAME"
 
-                            echo "Previous container restored"
+                            echo "Previous release restored."
 
-                        elif docker inspect "$APP_NAME" >/dev/null 2>&1; then
-                            # Tidak ada backup bernama OLD.
-                            # Jangan mengklaim rollback berhasil.
-                            echo "WARNING: No backup container found."
-                            echo "Current container has been left in place."
-                            exit 1
+                        elif [ "$HAD_PREVIOUS" = "true" ]; then
+                            if ! docker inspect "$APP_NAME" >/dev/null 2>&1; then
+                                echo "CRITICAL: Previous container is missing."
+                                exit 1
+                            fi
+
+                            CURRENT_IMAGE_ID=$(docker inspect \
+                                --format '{{.Image}}' "$APP_NAME")
+
+                            if [ "$CURRENT_IMAGE_ID" != "$PREVIOUS_IMAGE_ID" ]; then
+                                echo "CRITICAL: Current container is not the previous release."
+                                exit 1
+                            fi
+
+                            echo "Previous container is still under its original name."
+
+                            docker update --restart=unless-stopped "$APP_NAME"
+
+                            if [ "$(docker inspect \
+                                -f '{{.State.Running}}' "$APP_NAME")" != "true" ]; then
+                                docker start "$APP_NAME"
+                            fi
 
                         else
-                            echo "CRITICAL: No production container available."
-                            exit 1
+                            # First deployment: tidak ada release lama.
+                            echo "No previous release was available."
+
+                            if docker inspect "$APP_NAME" >/dev/null 2>&1; then
+                                docker rm -f "$APP_NAME"
+                            fi
+
+                            echo "Failed first deployment cleaned up."
+                            exit 0
                         fi
 
-                        # Verifikasi release yang dipulihkan.
+                        # Verifikasi container yang dipulihkan.
                         OK=0
 
                         for i in $(seq 1 15); do
@@ -314,16 +377,44 @@ pipeline {
                             exit 1
                         fi
 
-                        echo "ROLLBACK SUCCESS"
+                        # Verifikasi endpoint port production.
+                        # Gunakan image release sebelumnya sebagai pemeriksa endpoint.
+                        OK=0
+
+                        for i in $(seq 1 15); do
+                            if docker run --rm \
+                                --network host \
+                                --entrypoint wget \
+                                "$PREVIOUS_IMAGE_ID" \
+                                -q -O /dev/null \
+                                "http://127.0.0.1:${APP_PORT}/"; then
+                                OK=1
+                                break
+                            fi
+
+                            sleep 2
+                        done
+
+                        if [ "$OK" -ne 1 ]; then
+                            echo "CRITICAL: Restored endpoint check FAILED."
+                            exit 1
+                        fi
+
+                        echo "Restored production endpoint check PASSED."
+
+                        echo "Previous production release is healthy."
                     '''
                 }
             }
+        }
 
+        failure {
             echo 'PIPELINE FAILURE - Check Console Output.'
         }
 
         aborted {
-            echo 'PIPELINE ABORTED'
+            echo 'PIPELINE ABORTED - Inspect deployment state.'
         }
     }
+
 }

@@ -9,16 +9,11 @@ pipeline {
     }
 
     environment {
-        APP_NAME             = 'portfolio-web'
-        IMAGE_NAME           = 'portfolio-web'
-        APP_PORT             = '8081'
-        TEST_PORT            = '8082'
-        DEPLOYMENT_ATTEMPTED = 'false'
-        DEPLOYMENT_VERIFIED  = 'false'
-        HAD_PREVIOUS         = 'false'
-        PREVIOUS_CONTAINER   = ''
-        PREVIOUS_IMAGE_ID    = ''
-    }
+    APP_NAME  = 'portfolio-web'
+    IMAGE_NAME = 'portfolio-web'
+    APP_PORT  = '8081'
+    TEST_PORT = '8082'
+}
 
     stages {
         stage('1. Clone Code') {
@@ -143,6 +138,13 @@ pipeline {
             }
             steps {
                 script {
+                    env.DEPLOYMENT_ATTEMPTED = 'false'
+                    env.DEPLOYMENT_VERIFIED = 'false'
+                    env.HAD_PREVIOUS = 'false'
+                    env.PREVIOUS_CONTAINER = ''
+                    .PREVIOUS_IMAGE_ID = ''
+
+                     def backupName = "${env.APP_NAME}-previous-${env.BUILD_NUMBER}"
                     env.DEPLOYMENT_VERIFIED = 'false'
                     def backupName = "${env.APP_NAME}-previous-${env.BUILD_NUMBER}"
 

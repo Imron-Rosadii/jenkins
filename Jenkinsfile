@@ -156,6 +156,10 @@ pipeline {
                     }
 
                     env.PREVIOUS_CONTAINER = backupName
+                    echo "DEBUG BUILD_NUMBER = ${env.BUILD_NUMBER}"
+                    echo "DEBUG APP_NAME = ${env.APP_NAME}"
+                    echo "DEBUG backupName = ${backupName}"
+                    echo "DEBUG PREVIOUS_CONTAINER = ${env.PREVIOUS_CONTAINER}"
 
                     env.HAD_PREVIOUS = sh(
                         script: '''
@@ -187,6 +191,11 @@ pipeline {
 
                     sh '''
                         set -eu
+                        printf 'DEBUG shell PREVIOUS_CONTAINER=<%s>\n' \
+                        "${PREVIOUS_CONTAINER-UNSET}"
+
+                        printf 'DEBUG shell HAD_PREVIOUS=<%s>\n' \
+                        "${HAD_PREVIOUS-UNSET}"
 
                         OLD="$PREVIOUS_CONTAINER"
                         NEW_IMAGE="${IMAGE_NAME}:${GIT_COMMIT_SHORT}"
